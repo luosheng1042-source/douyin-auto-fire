@@ -1,0 +1,207 @@
+name: Douyin Send Healthcheck
+
+# ────────────────────────────────────────────────────────────────
+# 抖音续火花 · 每日发送体检 + 自动修复
+#
+# 运行时间：北京时间 10:00（UTC 02:00）—— 比 09:00 的发送晚 1 小时
+#
+# 判定「健康」的唯一标准（不靠运行结论，靠真实投递证据）：
+#   当日存在一条「已完成且成功」的 send.yml 运行，且其日志中
+#   出现「发送成功: ≥1」或「跳过（防重复）: ≥1」。
+#   —— 仅凭 conclusion=success 不够：空跑验证同样是 success，
+#      但它一条消息也没发。
+#
+# 处理策略：
+#   健康        → 直接结束，不做任何多余动作
+#   当日无记录  → 立即补发
+#   投递为空/被拒 → 等待后补发，最多 MAX_ATTEMPTS 次
+#   登录态失效  → 无法自动修复（需手机扫码），立即失败并报警
+#   有运行进行中 → 等待其结束再判定（避免重复发送）
+#
+# 上限设计说明：抖音风控对「同一天反复发送」敏感（2026-10-06 曾因
+# 13 分钟内连发 3 次导致登录态被作废），故当日补发设硬上限；
+# 真正的「持续重试」发生在跨天维度 —— 每天都体检，直到恢复正常。
+# ────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force_repair:
+        description: 忽略当日状态，强制补发一次
+        type: boolean
+        default: false
+
+# 注意：不能与 send.yml 共用并发组 —— 本工作流会触发 send.yml，
+# 共用会导致 send.yml 排队等本流结束、本流又等 send.yml 结束的死锁。
+concurrency:
+  group: douyin-healthcheck
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # 触发 send.yml
+  contents: read   # 读取运行记录与日志
+
+env:
+  MAX_ATTEMPTS: "2"     # 当日补发次数上限（+09:00 原始 1 次 = 最多 3 次/天）
+  REPAIR_WAIT: "1800"   # 每次补发前的等待秒数（30 分钟）
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FORCE_REPAIR: ${{ inputs.force_repair }}
+    steps:
+      - name: 体检并自动修复
+        shell: bash
+        run: |
+          set -uo pipefail
+          TZ_BJ="Asia/Shanghai"
+          TODAY=$(TZ="$TZ_BJ" date +%F)
+
+          # 诊断信息一律走 stderr，避免污染 evaluate() 的返回值
+          say() { echo "[$(TZ="$TZ_BJ" date '+%H:%M:%S')] $*" >&2; }
+
+          # 真实投递证据：发送成功≥1 或 防重复跳过≥1
+          # 注意：必须用 bash 内建 [[ =~ ]] 匹配，不能用 `printf | grep -q`。
+          # 本脚本开了 pipefail，而 grep -q 命中后立即退出会令 printf 收到
+          # SIGPIPE(141)，pipefail 遂把整条管道判为失败 —— 形成「匹配成功反而
+          # 判定为不匹配」的反向假阴性。
+          DELIVERED_RE='发送成功[:：][[:space:]]*[1-9]|跳过（防重复）[:：][[:space:]]*[1-9]'
+          AUTH_RE='AuthenticationError|登录状态失效|登录态失效'
+
+          # 返回值：healthy | running | none | auth | no_delivery | error
+          evaluate() {
+            local runs today_runs bj created status conclusion id lg inprog seen
+            local newest_id="" newest_log=""
+            runs=$(gh api "repos/$REPO/actions/workflows/send.yml/runs?per_page=40" \
+              --jq '.workflow_runs[] | "\(.created_at)\t\(.status)\t\(.conclusion)\t\(.id)"' 2>/dev/null) || {
+              echo "error"; return 0; }
+            [ -z "$runs" ] && { echo "error"; return 0; }
+
+            today_runs=""
+            while IFS=$'\t' read -r created status conclusion id; do
+              [ -z "${created:-}" ] && continue
+              bj=$(TZ="$TZ_BJ" date -d "$created" +%F 2>/dev/null || echo "")
+              if [ "$bj" = "$TODAY" ]; then
+                today_runs="${today_runs}${status}|${conclusion}|${id}"$'\n'
+                say "  今日运行 id=$id status=$status conclusion=$conclusion"
+              fi
+            done <<< "$runs"
+            today_runs=$(printf '%s' "$today_runs" | grep -v '^$' || true)
+            [ -z "$today_runs" ] && { echo "none"; return 0; }
+
+            inprog=0; seen=0
+            while IFS='|' read -r status conclusion id; do
+              [ -z "${id:-}" ] && continue
+              if [ "$status" != "completed" ]; then inprog=1; say "  运行 $id 仍在进行中"; continue; fi
+              lg=$(gh run view "$id" --repo "$REPO" --log 2>/dev/null || true)
+              if [ "$seen" -eq 0 ]; then seen=1; newest_id="$id"; newest_log="$lg"; fi
+              if [ "$conclusion" = "success" ]; then
+                if [[ "$lg" =~ $DELIVERED_RE ]]; then
+                  say "  运行 $id 成功且日志含真实投递证据"
+                  echo "healthy"; return 0
+                fi
+                say "  运行 $id 结论为成功，但无投递证据（空跑/无操作）"
+              else
+                say "  运行 $id 失败"
+              fi
+            done <<< "$today_runs"
+
+            [ "$seen" -eq 0 ] && [ "$inprog" -eq 1 ] && { echo "running"; return 0; }
+            [ "$seen" -eq 0 ] && { echo "running"; return 0; }
+            if [[ "$newest_log" =~ $AUTH_RE ]]; then
+              echo "auth"; return 0
+            fi
+            echo "no_delivery"; return 0
+          }
+
+          finish() {   # finish <状态> <说明> <结论:0成功/1失败>
+            {
+              echo "## 抖音续火花 · 每日发送体检"
+              echo ""
+              echo "| 项目 | 值 |"
+              echo "| --- | --- |"
+              echo "| 体检时间（北京） | $(TZ="$TZ_BJ" date '+%F %T') |"
+              echo "| 最终状态 | $1 |"
+              echo "| 说明 | $2 |"
+              echo "| 补发尝试次数 | ${attempt:-0} |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$3" -eq 0 ]; then say "✅ 结束：$1 — $2"; else say "❌ 结束：$1 — $2"; fi
+            exit "$3"
+          }
+
+          say "体检日期（北京时间）: $TODAY"
+          attempt=0
+          wait_rounds=0
+
+          if [ "${FORCE_REPAIR:-}" = "true" ]; then
+            say "手动强制补发模式"
+            reason="no_delivery"
+          else
+            reason=$(evaluate)
+            say "初次体检结果: $reason"
+          fi
+
+          while true; do
+            case "$reason" in
+              healthy)
+                finish "healthy" "今日已确认发送成功" 0 ;;
+              auth)
+                finish "auth" "抖音登录态已失效，需手机扫码重新登录（自动重试无效）" 1 ;;
+              running)
+                wait_rounds=$((wait_rounds + 1))
+                if [ "$wait_rounds" -gt 5 ]; then
+                  finish "running" "等待超时：当日仍有运行未结束" 1
+                fi
+                say "⏳ 等待进行中的运行结束（第 $wait_rounds 次）…"
+                sleep 120
+                reason=$(evaluate) ;;
+              error)
+                finish "error" "无法读取运行记录（Actions 权限或工作流被禁用）" 1 ;;
+              none)
+                if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+                  finish "none" "已尝试 $MAX_ATTEMPTS 次补发，仍无成功记录" 1
+                fi
+                attempt=$((attempt + 1))
+                say "今日无发送记录 → 立即补发（第 $attempt/$MAX_ATTEMPTS 次）"
+                gh workflow run send.yml --repo "$REPO" -f dry_run=false >&2 \
+                  || finish "error" "触发补发失败" 1
+                sleep 15
+                new_id=$(gh api "repos/$REPO/actions/workflows/send.yml/runs?per_page=1" \
+                  --jq '.workflow_runs[0].id' 2>/dev/null || echo "")
+                say "补发运行号: $new_id，等待完成…"
+                for i in $(seq 1 60); do
+                  sleep 10
+                  st=$(gh api "repos/$REPO/actions/runs/$new_id" \
+                    --jq '"\(.status)/\(.conclusion)"' 2>/dev/null || echo "?/?")
+                  case "$st" in completed/*) say "补发运行结束: $st"; break;; esac
+                done
+                reason=$(evaluate) ;;
+              no_delivery)
+                if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+                  finish "no_delivery" "已达当日补发上限 $MAX_ATTEMPTS 次，仍未确认投递成功" 1
+                fi
+                attempt=$((attempt + 1))
+                say "等待 $((REPAIR_WAIT / 60)) 分钟后补发（第 $attempt/$MAX_ATTEMPTS 次）…"
+                sleep "$REPAIR_WAIT"
+                gh workflow run send.yml --repo "$REPO" -f dry_run=false >&2 \
+                  || finish "error" "触发补发失败" 1
+                sleep 15
+                new_id=$(gh api "repos/$REPO/actions/workflows/send.yml/runs?per_page=1" \
+                  --jq '.workflow_runs[0].id' 2>/dev/null || echo "")
+                say "补发运行号: $new_id，等待完成…"
+                for i in $(seq 1 60); do
+                  sleep 10
+                  st=$(gh api "repos/$REPO/actions/runs/$new_id" \
+                    --jq '"\(.status)/\(.conclusion)"' 2>/dev/null || echo "?/?")
+                  case "$st" in completed/*) say "补发运行结束: $st"; break;; esac
+                done
+                reason=$(evaluate) ;;
+              *)
+                finish "unknown" "未识别的状态: $reason" 1 ;;
+            esac
+          done
