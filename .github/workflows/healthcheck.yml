@@ -31,6 +31,14 @@ on:
         description: 忽略当日状态，强制补发一次
         type: boolean
         default: false
+      dispatch_probe:
+        description: 自检：只验证「能否触发工作流」，不体检、不补发
+        type: boolean
+        default: false
+      probe_only:
+        description: （内部用）自检被触发时立即退出
+        type: boolean
+        default: false
 
 # 注意：不能与 send.yml 共用并发组 —— 本工作流会触发 send.yml，
 # 共用会导致 send.yml 排队等本流结束、本流又等 send.yml 结束的死锁。
@@ -54,6 +62,8 @@ jobs:
       REPO: ${{ github.repository }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       FORCE_REPAIR: ${{ inputs.force_repair }}
+      DISPATCH_PROBE: ${{ inputs.dispatch_probe }}
+      PROBE_ONLY: ${{ inputs.probe_only }}
     steps:
       - name: 体检并自动修复
         shell: bash
@@ -135,6 +145,20 @@ jobs:
           }
 
           say "体检日期（北京时间）: $TODAY"
+
+          # ── 自检：验证「本工作流是否有权触发工作流」——自动补发依赖该权限 ──
+          if [ "${PROBE_ONLY:-}" = "true" ]; then
+            finish "probe" "自检运行（未做体检、未补发）" 0
+          fi
+          if [ "${DISPATCH_PROBE:-}" = "true" ]; then
+            say "触发能力自检：尝试以本工作流的令牌触发本工作流…"
+            if gh workflow run healthcheck.yml --repo "$REPO" -f probe_only=true >&2; then
+              finish "probe_ok" "已具备触发工作流的权限 → 自动补发可用" 0
+            else
+              finish "probe_fail" "缺少触发工作流的权限 → 自动补发不可用" 1
+            fi
+          fi
+
           attempt=0
           wait_rounds=0
 
